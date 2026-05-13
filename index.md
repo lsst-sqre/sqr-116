@@ -2,8 +2,8 @@
 
 ```{abstract}
 The IVOA ConeSearch specification defines a simple protocol for querying astronomical source catalogs by sky position and radius.
-This technote describes the design and implementation of a ConeSearch service for the Rubin Science Platform (RSP), covering backend query execution via TAP, VOTable response construction, per-collection configuration, VERB-driven column selection, and compliance with the ConeSearch 1.03 specification.
-Key design decisions around UCD mapping, column verbosity levels, and multi-collection support are discussed with options and recommendations.
+This technote describes the design and implementation of a ConeSearch service for the Rubin Science Platform (RSP), covering backend query execution via TAP, streaming VOTable responses, per-collection configuration, VERB-driven column selection, and compliance with the ConeSearch 1.1 specification.
+Key design decisions around column verbosity levels, TAP query execution, and multi-collection support are discussed with options and recommendations.
 The service is built using the Safir FastAPI framework and deployed via Phalanx.
 ```
 
@@ -32,7 +32,7 @@ This technote describes the design of a dedicated IVOA-compliant ConeSearch serv
 
 ### Goals
 
-- Provide an IVOA ConeSearch 1.03 compliant service for RSP catalog data
+- Provide an IVOA ConeSearch 1.1 compliant service for RSP catalog data
 - Support multiple named catalog collections (dp1, dp2, etc.) with independent configuration
 - Return properly formed VOTable responses with required UCDs
 - Support VERB-driven verbosity levels
@@ -51,7 +51,7 @@ This technote describes the design of a dedicated IVOA-compliant ConeSearch serv
 
 ## 2. ConeSearch Standard Overview
 
-The IVOA ConeSearch 1.03 specification defines a simple HTTP GET interface.
+The IVOA ConeSearch 1.1 specification defines a simple HTTP GET interface.
 
 ### Query Parameters
 
@@ -61,6 +61,9 @@ The IVOA ConeSearch 1.03 specification defines a simple HTTP GET interface.
 | `DEC` | Yes | Declination of search position (ICRS decimal degrees, -90 to +90) |
 | `SR` | Yes | Search radius (decimal degrees, 0 to MaxSR) |
 | `VERB` | No | Verbosity level: 1 (minimal), 2 (default), 3 (all columns) |
+| `TIME` | No | Temporal filter as MJD value or range (e.g. `58000` or `58000/59000`) |
+| `MAXREC` | No | Maximum number of records to return |
+| `RESPONSEFORMAT` | No | Response format (default: `application/x-votable+xml`) |
 
 ### Response Format
 
@@ -86,10 +89,9 @@ A plain HTTP error response is not compliant.
 
 ### VOSI Endpoints
 
-The ConeSearch 1.03 specification predates VOSI and does not require `/capabilities` or `/availability` endpoints.
-However it seems to be common practice in the broader VO ecosystem is to include them.
-TAP, SIA, and other RSP services all implement VOSI endpoints and VO client libraries such as PyVO use `/capabilities` to discover what a service supports.
-For these reasons and because of it straightforward to support this service will implement both endpoints.
+ConeSearch 1.1 requires a `/capabilities` endpoint and encourages `/availability`.
+TAP, SIA, and other RSP services implement both, and VO client libraries such as PyVO use `/capabilities` to discover what a service supports.
+This service implements both endpoints.
 
 ## 3. Existing RSP Context
 
@@ -118,17 +120,17 @@ The choice of TAP execution mode (synchronous vs asynchronous UWS) is a key desi
 
 ## 4. Requirements
 
-- Accept `RA`, `DEC`, `SR` query parameters per the ConeSearch 1.03 specification
-- Accept optional `VERB` parameter (1, 2, 3) to control response column set
+- Accept `RA`, `DEC`, `SR` query parameters per the ConeSearch 1.1 specification
+- Accept optional `VERB` (1, 2, 3), `TIME`, `MAXREC`, and `RESPONSEFORMAT` parameters
 - Validate parameter ranges: RA in [0, 360], DEC in [-90, 90], SR in [0, MaxSR]
-- Return ConeSearch-compliant VOTable with the three required fields and correct UCDs
-- Return VOTable error responses or invalid parameters
+- Return ConeSearch-compliant VOTable with the three required fields
+- Return VOTable error responses for invalid parameters or TAP errors
 - Support multiple named collections with independent table, column, and MaxSR configuration
 - Enforce a configurable MaxSR per collection (default: 180 degrees)
 - Enforce a configurable MaxRecords per collection, limiting the number of rows returned
 - Authenticate requests via Gafaelfawr delegated token (requiring `read:tap` scope), forwarded to TAP
-- Expose `/capabilities` and `/availability` VOSI endpoints per collection
-- Return `Content-Type: text/xml` (ConeSearch spec requirement)
+- Expose `/capabilities` (required) and `/availability` (encouraged) VOSI endpoints per collection
+- Return `Content-Type: application/x-votable+xml`
 - Handle case-insensitive query parameters
 
 ## 5. Architecture
@@ -140,14 +142,13 @@ It exposes per-collection endpoints under `/api/conesearch/{collection}/`, where
 
 1. Client sends `GET /api/conesearch/{collection}/query?RA=…&DEC=…&SR=…&VERB=…`
 2. Handler validates parameters (range checks, MaxSR limit)
-3. Handler resolves the columns for the requested VERB level based on the 
-   collection configuration
+3. Handler resolves the columns for the requested VERB level based on the collection configuration
 4. Handler constructs an ADQL `CONTAINS/CIRCLE` query against the configured table
-5. Service executes a TAP query against the collection's configured TAP endpoint, forwarding the Gafaelfawr delegated token
-6. TAP returns a VOTable and our service transforms it, rewriting UCDs on the three required fields
-7. Transformed VOTable is returned to the client as `text/xml`
+5. Service opens a streaming request to the TAP `/sync` endpoint, forwarding the Gafaelfawr delegated token
+6. The first chunk of the TAP response is buffered to detect `QUERY_STATUS=ERROR` before committing to a success response
+7. On success, the TAP VOTable byte stream is forwarded directly to the client via `StreamingResponse`
 
-Error cases at steps 2 and 5 produce VOTable error responses (Not HTTP errors).
+Error cases at steps 2 and 5-6 produce VOTable error responses (not HTTP errors).
 
 
 ### Key Components
@@ -155,22 +156,20 @@ Error cases at steps 2 and 5 produce VOTable error responses (Not HTTP errors).
 **`Config`** Config holds service-wide settingsand a dictionary of named collections (collections: dict[str, CollectionConfig]). 
 Each CollectionConfig specifies the collection's TAP endpoint (tapUrl), the fully qualified catalog table name, the column names that map to the three required ConeSearch roles (idColumn, raColumn, decColumn), the maxSr and maxRecords limits and the path to the VERB column metadata file (verbColumnsPath).
 
-**`ConeSearchService`** is the class that will execute the TAP query and transforms the VOTable response. This will be instantiated per request via a factory.
+**`Factory`** is a per-request object that holds the HTTP client, delegated token, logger, and event publisher, and exposes a `create_conesearch_service()` method. It follows the same pattern used in other phalanx services.
 
-**`VotableTransformer`** will rewrite the UCDs on the three required fields and if applicable filter the columns based on the requested VERB level.
+**`ConeSearchService`** executes the TAP query and streams the VOTable response back to the caller as an async generator. It is instantiated per request via the `Factory`.
 
 
-### VOTable Transformation
+### Streaming Response
 
-TAP returns a VOTable with column names and UCDs drawn from the catalog schema.
-Since the ConeSearch spec requires specific UCDs on the three mandatory 
-fields, we will need to transform these UCDS, specifically:
+The TAP VOTable is streamed directly to the client without being loaded into memory.
+The service buffers only the first 8 KB of the TAP response to detect a `QUERY_STATUS=ERROR` VOTable (error documents are small and always appear in the XML header). Once the response is confirmed to be a success, the buffered bytes and all subsequent chunks are forwarded as a `StreamingResponse`.
 
-- The configured `id_column` -> `UCD: ID_MAIN`
-- The configured `ra_column` -> `UCD: POS_EQ_RA_MAIN`
-- The configured `dec_column` -> `UCD: POS_EQ_DEC_MAIN`
+This avoids loading potentially multi-GB result sets into process memory on the server.
+Note that VO client libraries such as PyVO still buffer the full response client-side to parse the VOTable.
 
-All other columns will be passed through unchanged (depending on VERB).
+UCD rewriting (applying `ID_MAIN`, `POS_EQ_RA_MAIN`, `POS_EQ_DEC_MAIN` to the configured columns) is left to the TAP service.
 
 
 ## 6. API
@@ -190,6 +189,9 @@ Executes a cone search query against the named collection.
 | `DEC` | Yes | Declination (decimal degrees) |
 | `SR` | Yes | Search radius (decimal degrees) |
 | `VERB` | No | Verbosity level: 1, 2, or 3 (default: 2) |
+| `TIME` | No | Temporal filter as MJD value or range (e.g. `58000/59000`) |
+| `MAXREC` | No | Maximum number of records to return |
+| `RESPONSEFORMAT` | No | Response format (default: `application/x-votable+xml`) |
 
 **Responses:**
 
@@ -277,24 +279,13 @@ over reasonable search radius will complete within this limit.
 Option B should be preferred only if experience shows queries 
 regularly approaching or exceeding the timeout. 
 
-It would be straightforward to start with Option A and switch to Option B if we find that the timeout is a problem in practice.
+**Option A was selected.** The TAP response is streamed via `httpx.AsyncClient.stream()`, keeping the server event loop non-blocking and avoiding in-process buffering of large results. Option B remains available if the 60-second sync timeout proves limiting in practice.
 
 ### 7.3 UCD Mapping
 
-The ConeSearch spec requires specific UCDs on the three mandatory fields. 
-These UCDs are likely not present on arbitrary TAP columns and must be applied by the ConeSearch service.
-
-The mapping is owned per-collection in service configuration:
-
-```yaml
-collections:
-  dp02:
-    id_column: objectId      # UCD: ID_MAIN
-    ra_column: coord_ra      #  UCD: POS_EQ_RA_MAIN
-    dec_column: coord_dec    # UCD: POS_EQ_DEC_MAIN
-```
-
-This configuration will be utilized by the `VotableTransformer` which will find these three fields in the TAP VOTable response by column name and rewrite their `ucd` attributes.
+The ConeSearch spec requires specific UCDs on the three mandatory fields.
+These old-style UCDs are not present in our existing catalogs which instead uses UCD1+.
+This implementation adds a custom UCD mapping as a query parameter to the TAP service which requests the UCD version for the relative columns, and then streams the TAP VOTable directly without transformation,  so the TAP-assigned UCDs are passed through unchanged.
 
 ## 8. Configuration
 
@@ -359,7 +350,7 @@ Per-environment configuration (per-collection TAP URLs, table names, Gafaelfawr 
 
 ## References
 
-- IVOA ConeSearch 1.03: https://www.ivoa.net/Documents/REC/DAL/ConeSearch-20080222.html
+- IVOA ConeSearch 1.1: https://www.ivoa.net/documents/ConeSearch/20200828/WD-ConeSearch-1.1-20200828.html
 - IVOA VOSI: https://www.ivoa.net/documents/VOSI/
 - datalinker: https://github.com/lsst-sqre/datalinker
 - SIA service: https://github.com/lsst-sqre/sia
